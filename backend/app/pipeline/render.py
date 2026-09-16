@@ -6,6 +6,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from ..store import Job, Moment, dump_json
+from . import brand
 from .captions import build_caption_overlay
 
 
@@ -13,7 +14,10 @@ OUTPUT_W = 1080
 OUTPUT_H = 1920
 FACE_H = 760
 GAME_H = OUTPUT_H - FACE_H
+CORNER_CAM = {"top_left", "top_right", "bottom_left", "bottom_right"}
 FONT = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+TWITCH_PURPLE = (145, 70, 255, 255)
+TWITCH_INK = (20, 17, 14, 255)
 
 
 def _ass_timestamp(seconds: float) -> str:
@@ -151,27 +155,218 @@ def write_text_overlay(
     return path
 
 
-def write_endcard(path: Path, watermark: str) -> Path:
-    img = Image.new("RGB", (OUTPUT_W, OUTPUT_H), (20, 17, 14))
+def _draw_twitch_glitch(draw: ImageDraw.ImageDraw, x: float, y: float, height: float) -> float:
+    width = height * 0.9
+    body = [
+        (x + width * 0.08, y),
+        (x + width * 0.92, y),
+        (x + width * 0.92, y + height * 0.70),
+        (x + width * 0.70, y + height * 0.96),
+        (x + width * 0.48, y + height * 0.96),
+        (x + width * 0.36, y + height * 0.82),
+        (x + width * 0.20, y + height * 0.82),
+        (x + width * 0.08, y + height * 0.70),
+    ]
+    draw.polygon(body, fill=TWITCH_PURPLE)
+    eye_w = width * 0.11
+    eye_h = height * 0.22
+    draw.rectangle(
+        [x + width * 0.30, y + height * 0.22, x + width * 0.30 + eye_w, y + height * 0.22 + eye_h],
+        fill=TWITCH_INK,
+    )
+    draw.rectangle(
+        [x + width * 0.56, y + height * 0.22, x + width * 0.56 + eye_w, y + height * 0.22 + eye_h],
+        fill=TWITCH_INK,
+    )
+    return width
+
+
+def write_watermark_overlay(path: Path, watermark: str) -> Path:
+    img = Image.new("RGBA", (OUTPUT_W, OUTPUT_H), (0, 0, 0, 0))
+    text = (watermark or "").strip()
+    if not text:
+        img.save(path, "PNG")
+        return path
     draw = ImageDraw.Draw(img)
     try:
-        font_lg = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 72)
-        font_sm = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 42)
+        font = ImageFont.truetype(FONT, 42)
     except OSError:
-        font_lg = ImageFont.load_default()
-        font_sm = font_lg
-    title = "смотри стрим"
-    lines = [(title, font_sm, 820, (232, 196, 168))]
-    if watermark:
-        lines.append((watermark, font_lg, 900, (255, 245, 235)))
-    else:
-        lines.append(("полный эфир на Twitch", font_lg, 900, (255, 245, 235)))
-    for text, font, y, fill in lines:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        x = (OUTPUT_W - (bbox[2] - bbox[0])) / 2
-        draw.text((x, y), text, font=font, fill=fill)
+        font = ImageFont.load_default()
+    icon_h = 52
+    gap = 14
+    icon_w = icon_h * 0.9
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    group_w = icon_w + gap + text_w
+    group_h = max(icon_h, text_h)
+    x = OUTPUT_W - 56 - group_w
+    y = (OUTPUT_H - group_h) / 2
+    _draw_twitch_glitch(draw, x, y + (group_h - icon_h) / 2, icon_h)
+    tx = x + icon_w + gap
+    ty = y + (group_h - text_h) / 2 - 4
+    for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2)):
+        draw.text((tx + dx, ty + dy), text, font=font, fill=(0, 0, 0, 230))
+    draw.text((tx, ty), text, font=font, fill=(255, 245, 235, 240))
     img.save(path, "PNG")
     return path
+
+
+def _handle_parts(watermark: str) -> tuple[str, str]:
+    raw = (watermark or "").strip()
+    cleaned = (
+        raw.replace("https://", "")
+        .replace("http://", "")
+        .replace("www.", "")
+        .strip("/")
+    )
+    if "/" in cleaned:
+        _, nick = cleaned.rsplit("/", 1)
+        return "twitch.tv/", nick or cleaned
+    if cleaned:
+        return "twitch.tv/", cleaned
+    return "", "Twitch"
+
+
+def _font(path: str, size: int):
+    try:
+        return ImageFont.truetype(path, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _fit_font(draw: ImageDraw.ImageDraw, text: str, max_width: int, start: int, floor: int = 64):
+    for size in range(start, floor - 1, -4):
+        font = _font(FONT, size)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            return font, bbox
+    font = _font(FONT, floor)
+    return font, draw.textbbox((0, 0), text, font=font)
+
+
+def _crop_opaque(img: Image.Image) -> Image.Image:
+    alpha = img.split()[-1]
+    bbox = alpha.getbbox()
+    if not bbox:
+        return img
+    pad = 12
+    left = max(0, bbox[0] - pad)
+    top = max(0, bbox[1] - pad)
+    right = min(img.width, bbox[2] + pad)
+    bottom = min(img.height, bbox[3] + pad)
+    return img.crop((left, top, right, bottom))
+
+
+def write_endcard_title(path: Path) -> Path:
+    img = Image.new("RGBA", (OUTPUT_W, OUTPUT_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = _font("/System/Library/Fonts/Supplemental/Arial.ttf", 48)
+    text = "смотри стрим"
+    bbox = draw.textbbox((0, 0), text, font=font)
+    x = (OUTPUT_W - (bbox[2] - bbox[0])) / 2
+    draw.text((x, 0), text, font=font, fill=(232, 196, 168, 255))
+    _crop_opaque(img).save(path, "PNG")
+    return path
+
+
+def write_endcard_nick(path: Path, watermark: str) -> Path:
+    img = Image.new("RGBA", (OUTPUT_W, OUTPUT_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    prefix, nick = _handle_parts(watermark)
+    nick_font, nick_box = _fit_font(draw, nick, OUTPUT_W - 80, 168, 72)
+    nick_w = nick_box[2] - nick_box[0]
+    nick_h = nick_box[3] - nick_box[1]
+    prefix_font = _font("/System/Library/Fonts/Supplemental/Arial.ttf", 40)
+    prefix_box = draw.textbbox((0, 0), prefix, font=prefix_font) if prefix else (0, 0, 0, 0)
+    prefix_w = prefix_box[2] - prefix_box[0]
+    prefix_h = prefix_box[3] - prefix_box[1]
+    icon_h = 92
+    icon_w = icon_h * 0.9
+    gap = 18
+    header_w = icon_w + (gap + prefix_w if prefix else 0)
+    content_w = max(header_w, nick_w)
+    x0 = (OUTPUT_W - content_w) / 2
+    y = 0
+    _draw_twitch_glitch(draw, x0, y + max(0, (prefix_h - icon_h) / 2), icon_h)
+    if prefix:
+        draw.text((x0 + icon_w + gap, y + max(0, (icon_h - prefix_h) / 2)), prefix, font=prefix_font, fill=(232, 196, 168, 230))
+    nick_x = (OUTPUT_W - nick_w) / 2
+    nick_y = max(icon_h, prefix_h) + 18
+    for dx, dy in ((-4, 0), (4, 0), (0, -4), (0, 4), (-3, -3), (3, 3)):
+        draw.text((nick_x + dx, nick_y + dy), nick, font=nick_font, fill=(0, 0, 0, 210))
+    draw.text((nick_x, nick_y), nick, font=nick_font, fill=(255, 245, 235, 255))
+    _crop_opaque(img).save(path, "PNG")
+    return path
+
+
+def render_endcard_clip(folder: Path, dest: Path, watermark: str, duration: float) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    bg = folder / "endcard_bg.png"
+    title = folder / "endcard_title.png"
+    nick = folder / "endcard_nick.png"
+    script = folder / "endcard.filter"
+    Image.new("RGB", (OUTPUT_W, OUTPUT_H), (16, 13, 11)).save(bg)
+    write_endcard_title(title)
+    write_endcard_nick(nick, watermark)
+    dur = max(2.4, float(duration))
+    script.write_text(
+        "[0:v]fps=30,format=yuv420p[bg];\n"
+        "[1:v]format=rgba,fade=t=in:st=0.08:d=0.32:alpha=1[title];\n"
+        "[2:v]format=rgba,fade=t=in:st=0.22:d=0.42:alpha=1,"
+        "scale=w='iw*(0.82+0.18*min(1,max(0,(t-0.22)/0.45)))':"
+        "h='ih*(0.82+0.18*min(1,max(0,(t-0.22)/0.45)))':eval=frame[nick];\n"
+        "[bg][title]overlay=(W-w)/2:(H-h)/2-280[mid];\n"
+        "[mid][nick]overlay=(W-w)/2:(H-h)/2+10\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-t",
+            f"{dur:.2f}",
+            "-i",
+            str(bg),
+            "-loop",
+            "1",
+            "-t",
+            f"{dur:.2f}",
+            "-i",
+            str(title),
+            "-loop",
+            "1",
+            "-t",
+            f"{dur:.2f}",
+            "-i",
+            str(nick),
+            "-filter_complex_script",
+            str(script),
+            "-t",
+            f"{dur:.2f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            str(dest),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not dest.exists():
+        raise RuntimeError(result.stderr[-2000:] if result.stderr else "endcard render failed")
+    return dest
+
+
+def _even(value: int) -> int:
+    return int(value) - (int(value) % 2)
 
 
 def _cam_crop(position: str, width: int, height: int) -> tuple[int, int, int, int]:
@@ -180,18 +375,17 @@ def _cam_crop(position: str, width: int, height: int) -> tuple[int, int, int, in
         return int(width * 0.505), int(height * 0.09), int(width * 0.48), int(height * 0.52)
     if position == "left":
         return int(width * 0.015), int(height * 0.09), int(width * 0.48), int(height * 0.52)
-    cam_w = int(width * 0.24)
-    cam_h = int(height * 0.30)
-    margin_x = int(width * 0.02)
-    margin_y = int(height * 0.03)
+    cam_w = _even(int(width * 0.21))
+    cam_h = _even(int(height * 0.26))
+    margin_x = int(width * 0.01)
     if position == "top_left":
-        x, y = margin_x, margin_y
+        x, y = margin_x, int(height * 0.04)
     elif position == "bottom_left":
-        x, y = margin_x, height - cam_h - margin_y
+        x, y = margin_x, int(height * 0.52)
     elif position == "bottom_right":
-        x, y = width - cam_w - margin_x, height - cam_h - margin_y
+        x, y = width - cam_w - margin_x, int(height * 0.52)
     else:
-        x, y = width - cam_w - margin_x, margin_y
+        x, y = width - cam_w - margin_x, int(height * 0.04)
     return x, y, cam_w, cam_h
 
 
@@ -207,6 +401,13 @@ def _game_crop(position: str, width: int, height: int) -> tuple[int, int, int, i
         x = max(0, (width - crop_w) // 3)
     else:
         x = min(width - crop_w, (width - crop_w) * 2 // 3)
+    return x, 0, crop_w, crop_h
+
+
+def _game_fill_crop(width: int, height: int) -> tuple[int, int, int, int]:
+    crop_h = height
+    crop_w = min(width, _even(int(round(height * 9 / 16))))
+    x = (width - crop_w) // 2
     return x, 0, crop_w, crop_h
 
 
@@ -247,16 +448,14 @@ def render_moment(
     words: list[dict],
 ) -> Path:
     out = job.path("clips", f"{moment.id}.mp4")
-    endcard = job.path("clips", "endcard.png")
+    endcard = job.path("clips", "endcard.mp4")
     watermark_png = job.path("clips", "watermark.png")
-    if not endcard.exists():
-        write_endcard(endcard, job.settings.watermark)
-    if not watermark_png.exists():
-        write_text_overlay(watermark_png, corner=job.settings.watermark)
+    duration = max(job.settings.clip_min_sec, min(job.settings.clip_max_sec, moment.end - moment.start))
+    cta = max(2.5, float(job.settings.cta_seconds))
+    write_watermark_overlay(watermark_png, job.settings.watermark)
+    render_endcard_clip(job.path("clips"), endcard, job.settings.watermark, cta)
 
     width, height = probe_size(source)
-    duration = max(job.settings.clip_min_sec, min(job.settings.clip_max_sec, moment.end - moment.start))
-    cta = job.settings.cta_seconds
     captions = build_caption_overlay(
         job.path("clips", "captions", moment.id),
         words,
@@ -273,11 +472,22 @@ def render_moment(
     else:
         mode = moment.layout_mode
 
-    cam = job.settings.facecam_position
-    if cam == "auto":
-        cam = moment.cam_position or "right"
+    user_cam = job.settings.facecam_position
+    cam = user_cam if user_cam != "auto" else (moment.cam_position or "right")
 
-    if mode == "face_full":
+    if user_cam in CORNER_CAM:
+        cx, cy, cw, ch = _cam_crop(user_cam, width, height)
+        gx, gy, gw, gh = _game_fill_crop(width, height)
+        face_h = _even(max(420, min(760, int(round(OUTPUT_W * ch / max(cw, 1))))))
+        prep = (
+            f"[0:v]trim=duration={duration:.3f},setpts=PTS-STARTPTS,split=2[camsrc][gamesrc];"
+            f"[gamesrc]crop={gw}:{gh}:{gx}:{gy},scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+            f"crop={OUTPUT_W}:{OUTPUT_H}[game];"
+            f"[camsrc]crop={cw}:{ch}:{cx}:{cy},scale={OUTPUT_W}:{face_h}:force_original_aspect_ratio=increase,"
+            f"crop={OUTPUT_W}:{face_h}[face];"
+            f"[game][face]overlay=0:0,format=yuv420p[base];"
+        )
+    elif mode == "face_full":
         fx, fy, fw, fh = _face_full_crop(width, height, moment.face_cx or 0.5)
         prep = (
             f"[0:v]trim=duration={duration:.3f},setpts=PTS-STARTPTS,"
@@ -300,8 +510,7 @@ def render_moment(
         + "[3:v]format=rgba[wm];[4:v]format=rgba,setpts=PTS-STARTPTS[cap];"
         + "[base][wm]overlay=0:0[marked];"
         + "[marked][cap]overlay=0:0,fps=30,setsar=1,format=yuv420p[mainv];"
-        + f"[1:v]scale={OUTPUT_W}:{OUTPUT_H},setsar=1,fps=30,format=yuv420p,"
-        + f"trim=duration={cta},setpts=PTS-STARTPTS[endv];"
+        + f"[1:v]trim=duration={cta:.3f},setpts=PTS-STARTPTS,fps=30,setsar=1,format=yuv420p[endv];"
         + f"[0:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS,"
         + "aresample=48000,aformat=channel_layouts=stereo,dynaudnorm[maina];"
         + f"[2:a]atrim=duration={cta},asetpts=PTS-STARTPTS,"
@@ -318,10 +527,6 @@ def render_moment(
         f"{duration + 0.25:.3f}",
         "-i",
         str(source),
-        "-loop",
-        "1",
-        "-t",
-        str(cta + 0.2),
         "-i",
         str(endcard),
         "-f",
@@ -374,6 +579,7 @@ def render_moment(
 
 
 def write_clips_meta(job: Job, moments: list[Moment]) -> None:
+    brand.refresh_tiktok_copy(job)
     meta = []
     for moment in moments:
         meta.append(

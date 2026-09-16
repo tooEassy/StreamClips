@@ -10,8 +10,9 @@ from uuid import uuid4
 from openai import OpenAI
 
 from ..config import settings
-from ..store import Job, Moment, dump_json
+from ..store import Job, Moment, CaptionWord, dump_json
 from . import brand
+from .captions import editor_words
 from .layout import attach_layouts, classify_moment
 
 
@@ -260,8 +261,8 @@ def rank_with_llm(job: Job, candidates: list[dict]) -> list[dict] | None:
   "title": string,  // рабочий заголовок для нас
   "reason": string, // почему залетит, 1 предложение
   "on_screen_text": string, // короткий текст поверх, можно = hook
-  "tiktok_caption": string, // описание ролика{(' + CTA на ' + brand.channel_cta(job.settings.watermark)) if brand.channel_cta(job.settings.watermark) else ''}
-  "hashtags": [string]
+  "tiktok_caption": string, // короткое описание БЕЗ ссылки и БЕЗ хештегов, 1 предложение
+  "hashtags": [string]      // 3–5 тематических тегов без twitch url
 }}]
 
 Кандидаты:
@@ -350,21 +351,32 @@ def make_preview(source: Path, start: float, dest: Path, duration: float = 7.0) 
             "-i",
             str(source),
             "-t",
-            f"{duration:.2f}",
+            f"{max(1.0, duration):.2f}",
             "-vf",
-            "scale=540:-2",
+            "scale=640:-2",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
             "28",
-            "-an",
+            "-c:a",
+            "aac",
+            "-ac",
+            "2",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
             str(dest),
         ],
         check=True,
         capture_output=True,
     )
+
+
+def _caption_words(transcript: dict, start: float, end: float) -> list[CaptionWord]:
+    return [CaptionWord.model_validate(item) for item in editor_words(transcript.get("words") or [], start, end)]
 
 
 def analyze_job(job: Job, transcript: dict, energy: dict, source: Path) -> list[Moment]:
@@ -392,7 +404,7 @@ def analyze_job(job: Job, transcript: dict, energy: dict, source: Path) -> list[
         moment_id = uuid4().hex[:8]
         preview = job.path("previews", f"{moment_id}.mp4")
         try:
-            make_preview(source, item["start"], preview)
+            make_preview(source, item["start"], preview, duration=max(4.0, min(20.0, float(item["end"]) - float(item["start"]))))
             preview_rel = f"previews/{moment_id}.mp4"
         except Exception:
             preview_rel = None
@@ -417,10 +429,13 @@ def analyze_job(job: Job, transcript: dict, energy: dict, source: Path) -> list[
                 preview_path=preview_rel,
                 heuristic_score=heuristic,
                 energy=energy_val,
+                caption_words=_caption_words(transcript, item["start"], item["end"]),
             )
         )
     attach_layouts(job, source, moments)
-    _mix_gameplay_moments(job, source, moments, candidates)
+    _mix_gameplay_moments(job, source, moments, candidates, transcript)
+    job.moments = moments
+    brand.refresh_tiktok_copy(job)
     return moments
 
 
@@ -432,7 +447,13 @@ def _overlaps(start: float, end: float, moments: list[Moment]) -> bool:
     return False
 
 
-def _mix_gameplay_moments(job: Job, source: Path, moments: list[Moment], candidates: list[dict]) -> None:
+def _mix_gameplay_moments(
+    job: Job,
+    source: Path,
+    moments: list[Moment],
+    candidates: list[dict],
+    transcript: dict,
+) -> None:
     if sum(1 for m in moments if m.layout_mode == "game_pip") >= 2:
         return
     workdir = job.path("layouts")
@@ -454,7 +475,12 @@ def _mix_gameplay_moments(job: Job, source: Path, moments: list[Moment], candida
         preview = job.path("previews", f"{moment_id}.mp4")
         preview_rel = None
         try:
-            make_preview(source, cand["start"], preview)
+            make_preview(
+                source,
+                cand["start"],
+                preview,
+                duration=max(4.0, min(20.0, float(cand["end"]) - float(cand["start"]))),
+            )
             preview_rel = f"previews/{moment_id}.mp4"
         except Exception:
             pass
@@ -480,6 +506,7 @@ def _mix_gameplay_moments(job: Job, source: Path, moments: list[Moment], candida
             layout_mode="game_pip",
             cam_position=info["cam_position"],
             face_cx=info["face_cx"],
+            caption_words=_caption_words(transcript, cand["start"], cand["end"]),
         )
         moments.append(moment)
         added += 1

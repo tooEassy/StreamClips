@@ -22,6 +22,12 @@ export type StageBar = {
   total_sec?: number | null;
 };
 
+export type CaptionWord = {
+  word: string;
+  start: number;
+  end: number;
+};
+
 export type Moment = {
   id: string;
   start: number;
@@ -39,6 +45,7 @@ export type Moment = {
   layout_mode?: "face_full" | "game_pip";
   cam_position?: string;
   face_cx?: number;
+  caption_words?: CaptionWord[];
 };
 
 export type Job = {

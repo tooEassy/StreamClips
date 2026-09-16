@@ -80,7 +80,13 @@ class JobSettings(BaseModel):
     propose_count: int = 12
     whisper_model: str = "large-v3"
     language: str = "ru"
-    cta_seconds: float = 2.0
+    cta_seconds: float = 2.5
+
+
+class CaptionWord(BaseModel):
+    word: str
+    start: float
+    end: float
 
 
 class Moment(BaseModel):
@@ -102,6 +108,8 @@ class Moment(BaseModel):
     layout_mode: Literal["face_full", "game_pip"] = "face_full"
     cam_position: str = "right"
     face_cx: float = 0.5
+    caption_words: list[CaptionWord] = Field(default_factory=list)
+    captions_edited: bool = False
 
 
 class Job(BaseModel):

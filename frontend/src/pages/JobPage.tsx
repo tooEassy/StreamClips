@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { Job, api, fileUrl, fmtTime } from "../api";
+import { CaptionWord, Job, api, fileUrl, fmtTime } from "../api";
+import { ClipPreview } from "../components/ClipPreview";
 import { StageBars, statusLabel } from "../components/StageBars";
 
 const ACTIVE = ["queued", "downloading", "extracting_audio", "transcribing", "analyzing", "rendering"];
@@ -11,6 +12,10 @@ export default function JobPage() {
   const [picked, setPicked] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [drafts, setDrafts] = useState<Record<string, CaptionWord[]>>({});
+  const [openCaptions, setOpenCaptions] = useState<Record<string, boolean>>({});
+  const [savingId, setSavingId] = useState<string | null>(null);
+  const [showHidden, setShowHidden] = useState(false);
 
   async function refresh() {
     if (!id) return;
@@ -18,8 +23,10 @@ export default function JobPage() {
     setJob(data);
     setPicked((prev) => {
       if (Object.keys(prev).length) return prev;
+      const chosen = data.moments.filter((m) => m.selected || m.output_path);
+      const source = chosen.length ? chosen : data.moments.slice(0, 5);
       const next: Record<string, boolean> = {};
-      data.moments.slice(0, 5).forEach((m) => {
+      source.forEach((m) => {
         next[m.id] = true;
       });
       return next;
@@ -91,11 +98,68 @@ export default function JobPage() {
     }
   }
 
+  async function toggleCaptions(momentId: string) {
+    const next = !openCaptions[momentId];
+    setOpenCaptions((p) => ({ ...p, [momentId]: next }));
+    if (!next || drafts[momentId] || !id) return;
+    try {
+      const data = await api<{ words: CaptionWord[] }>(`/api/jobs/${id}/moments/${momentId}/captions`);
+      setDrafts((p) => ({ ...p, [momentId]: data.words }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function updateWord(momentId: string, index: number, word: string) {
+    setDrafts((p) => {
+      const list = [...(p[momentId] || [])];
+      list[index] = { ...list[index], word };
+      return { ...p, [momentId]: list };
+    });
+  }
+
+  function removeWord(momentId: string, index: number) {
+    setDrafts((p) => ({
+      ...p,
+      [momentId]: (p[momentId] || []).filter((_, i) => i !== index),
+    }));
+  }
+
+  async function remountCaptions(momentId: string) {
+    if (!id) return;
+    setSavingId(momentId);
+    setError(null);
+    try {
+      await api(`/api/jobs/${id}/moments/${momentId}/captions`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ words: drafts[momentId] || [] }),
+      });
+      await api(`/api/jobs/${id}/moments/${momentId}/rerender`, { method: "POST" });
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingId(null);
+    }
+  }
+
   if (!job) {
     return <div className="panel">Загружаю…</div>;
   }
 
   const working = ACTIVE.includes(job.status);
+  const focused =
+    job.status === "rendering" ||
+    job.status === "done" ||
+    job.moments.some((m) => m.output_path);
+  const visibleMoments = job.moments.filter((m) => {
+    if (showHidden || !focused) return true;
+    if (m.selected || m.output_path) return true;
+    if (job.status === "rendering" && picked[m.id]) return true;
+    return false;
+  });
+  const hiddenCount = job.moments.length - visibleMoments.length;
 
   return (
     <div>
@@ -126,6 +190,11 @@ export default function JobPage() {
               {busy ? "Отправляю…" : `Смонтировать выбранные (${selectedIds.length})`}
             </button>
           ) : null}
+          {hiddenCount > 0 ? (
+            <button className="btn secondary" onClick={() => setShowHidden((v) => !v)}>
+              {showHidden ? "Скрыть остальные" : `Показать остальные (${hiddenCount})`}
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -141,14 +210,20 @@ export default function JobPage() {
       ) : null}
 
       <div className="grid">
-        {job.moments.map((m) => (
-          <article key={m.id} className={`card ${picked[m.id] ? "picked" : ""}`}>
+        {visibleMoments.map((m) => (
+          <article key={m.id} className={`card ${picked[m.id] ? "picked" : ""} ${m.output_path ? "card-clip" : "card-source"}`}>
             {m.output_path ? (
-              <video key={m.output_path + (job.updated_at || "")} src={fileUrl(job.id, m.output_path, job.updated_at)} controls />
-            ) : m.preview_path ? (
-              <video src={fileUrl(job.id, m.preview_path, job.updated_at)} muted loop playsInline controls />
+              <ClipPreview
+                src={fileUrl(job.id, m.output_path, job.updated_at)}
+                mode="tiktok"
+              />
             ) : (
-              <video src={`${fileUrl(job.id, "source.mp4")}#t=${m.start},${m.end}`} controls />
+              <ClipPreview
+                src={`${fileUrl(job.id, "source.mp4")}#t=${m.start}`}
+                start={m.start}
+                end={m.end}
+                mode="source"
+              />
             )}
             <div className="body">
               <label className="check">
@@ -162,16 +237,75 @@ export default function JobPage() {
               </label>
               <strong>{m.hook || m.title}</strong>
               <div className="meta">
-                {m.layout_mode === "game_pip"
-                  ? `игра + камера (${m.cam_position === "left" ? "слева" : "справа"})`
-                  : "камера на весь кадр → 9:16"}
+                {["top_left", "top_right", "bottom_left", "bottom_right"].includes(job.settings.facecam_position)
+                  ? "игра на весь кадр + вебка сверху"
+                  : m.layout_mode === "game_pip"
+                    ? `игра + камера (${m.cam_position === "left" ? "слева" : "справа"})`
+                    : "камера на весь кадр → 9:16"}
               </div>
               <div className="reason">{m.reason}</div>
-              {m.tiktok_caption ? <div className="meta">{m.tiktok_caption}</div> : null}
+              {m.tiktok_caption ? (
+                <div className="tiktok-copy">
+                  <div className="meta">описание для TikTok</div>
+                  <pre>{m.tiktok_caption}</pre>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    onClick={() => navigator.clipboard.writeText(m.tiktok_caption)}
+                  >
+                    копировать
+                  </button>
+                </div>
+              ) : null}
               {m.output_path ? (
                 <a className="hint" href={fileUrl(job.id, m.output_path)} download>
                   скачать mp4
                 </a>
+              ) : null}
+              {m.output_path ? (
+                <div className="caption-edit">
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    onClick={() => toggleCaptions(m.id)}
+                  >
+                    {openCaptions[m.id] ? "Скрыть субтитры" : "Править субтитры"}
+                  </button>
+                  {openCaptions[m.id] ? (
+                    <>
+                      <p className="meta">
+                        Поправь слова, если Whisper ошибся, и перемонтируй только этот клип.
+                      </p>
+                      <div className="caption-words">
+                        {(drafts[m.id] || []).map((word, index) => (
+                          <span key={`${word.start}-${index}`} className="caption-chip">
+                            <input
+                              type="text"
+                              value={word.word}
+                              onChange={(e) => updateWord(m.id, index, e.target.value)}
+                            />
+                            <button
+                              type="button"
+                              className="chip-del"
+                              onClick={() => removeWord(m.id, index)}
+                              aria-label="удалить слово"
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={savingId === m.id || working}
+                        onClick={() => remountCaptions(m.id)}
+                      >
+                        {savingId === m.id ? "Монтирую…" : "Сохранить и перемонтировать"}
+                      </button>
+                    </>
+                  ) : null}
+                </div>
               ) : null}
             </div>
           </article>

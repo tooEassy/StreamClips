@@ -20,6 +20,11 @@ export default function Home() {
   }
 
   useEffect(() => {
+    api<{ watermark?: string }>("/api/health")
+      .then((h) => {
+        if (h.watermark) setWatermark((current) => current || h.watermark || "");
+      })
+      .catch(() => undefined);
     refresh().catch((e) => setError(String(e)));
     const t = setInterval(() => refresh().catch(() => undefined), 2000);
     return () => clearInterval(t);

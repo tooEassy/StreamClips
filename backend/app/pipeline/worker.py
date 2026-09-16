@@ -34,6 +34,22 @@ def enqueue_render(job_id: str, moment_ids: list[str]) -> None:
     _queue.put(("render", job_id, moment_ids))
 
 
+def _words_for_moment(moment, transcript_words: list[dict]) -> list[dict]:
+    if moment.captions_edited:
+        return [
+            {"word": item.word, "start": item.start, "end": item.end}
+            for item in moment.caption_words
+            if item.word.strip()
+        ]
+    if moment.caption_words:
+        return [
+            {"word": item.word, "start": item.start, "end": item.end}
+            for item in moment.caption_words
+            if item.word.strip()
+        ]
+    return transcript_words
+
+
 def _mark_cancelled(job_id: str) -> None:
     try:
         job = load_job(job_id)
@@ -155,6 +171,7 @@ def _process(job: Job) -> None:
 
 def _render(job: Job, moment_ids: list[str]) -> None:
     check(job.id)
+    job = load_job(job.id)
     wanted = set(moment_ids)
     selected = [m for m in job.moments if m.id in wanted]
     if not selected:
@@ -184,7 +201,7 @@ def _render(job: Job, moment_ids: list[str]) -> None:
             status="rendering",
             stage=f"Рендер {i}/{total}: {moment.hook[:40]}",
         )
-        path = render_moment(job, moment, src, words)
+        path = render_moment(job, moment, src, _words_for_moment(moment, words))
         for item in job.moments:
             if item.id == moment.id:
                 item.output_path = f"clips/{path.name}"

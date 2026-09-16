@@ -49,6 +49,17 @@ def _display(word: str) -> str:
     return text.upper()
 
 
+def editor_words(words: list[dict], clip_start: float, clip_end: float) -> list[dict]:
+    return [
+        {
+            "word": item["raw"],
+            "start": round(float(item["start"]), 3),
+            "end": round(float(item["end"]), 3),
+        }
+        for item in clip_words(words, clip_start, clip_end)
+    ]
+
+
 def clip_words(words: list[dict], clip_start: float, clip_end: float) -> list[dict]:
     out: list[dict] = []
     for item in words:

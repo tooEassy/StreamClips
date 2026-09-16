@@ -12,9 +12,11 @@ from pydantic import BaseModel
 from .config import settings
 from .pipeline.cancel import clear as clear_cancel
 from .pipeline.cancel import request as request_cancel
+from .pipeline import brand
+from .pipeline.captions import editor_words
 from .pipeline.ingest import normalize_twitch_url
 from .pipeline.worker import enqueue_process, enqueue_render, start_worker
-from .store import JobSettings, default_stages, list_jobs, load_job, new_job, save_job
+from .store import CaptionWord, JobSettings, default_stages, list_jobs, load_job, load_json, new_job, save_job
 
 
 app = FastAPI(title="Stream Clips", version="0.1.0")
@@ -33,6 +35,24 @@ def _startup() -> None:
 
 class RenderBody(BaseModel):
     moment_ids: list[str]
+
+
+class CaptionsBody(BaseModel):
+    words: list[CaptionWord]
+
+
+def _job_or_404(job_id: str):
+    try:
+        return load_job(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "job not found") from exc
+
+
+def _moment_or_404(job, moment_id: str):
+    for moment in job.moments:
+        if moment.id == moment_id:
+            return moment
+    raise HTTPException(404, "moment not found")
 
 
 def _settings_from(
@@ -60,6 +80,7 @@ def health() -> dict:
         "ffmpeg": ffmpeg,
         "has_llm_key": bool(settings.openai_api_key),
         "whisper_model": settings.whisper_model,
+        "watermark": settings.watermark,
         "data_dir": str(settings.data_dir),
     }
 
@@ -106,9 +127,11 @@ async def create_job(
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> dict:
     try:
-        return load_job(job_id).model_dump()
+        job = load_job(job_id)
     except FileNotFoundError as exc:
         raise HTTPException(404, "job not found") from exc
+    brand.refresh_tiktok_copy(job)
+    return job.model_dump()
 
 
 @app.post("/api/jobs/{job_id}/render")
@@ -124,6 +147,42 @@ def render_job(job_id: str, body: RenderBody) -> dict:
     enqueue_render(job.id, body.moment_ids)
     job.status = "rendering"
     job.stage = "Монтаж в очереди"
+    save_job(job)
+    return job.model_dump()
+
+
+@app.get("/api/jobs/{job_id}/moments/{moment_id}/captions")
+def get_captions(job_id: str, moment_id: str) -> dict:
+    job = _job_or_404(job_id)
+    moment = _moment_or_404(job, moment_id)
+    if moment.caption_words:
+        return {"words": [w.model_dump() for w in moment.caption_words]}
+    transcript_path = job.path("transcript.json")
+    if not transcript_path.exists():
+        return {"words": []}
+    transcript = load_json(transcript_path)
+    return {"words": editor_words(transcript.get("words") or [], moment.start, moment.end)}
+
+
+@app.put("/api/jobs/{job_id}/moments/{moment_id}/captions")
+def save_captions(job_id: str, moment_id: str, body: CaptionsBody) -> dict:
+    job = _job_or_404(job_id)
+    moment = _moment_or_404(job, moment_id)
+    moment.caption_words = [item for item in body.words if item.word.strip()]
+    moment.captions_edited = True
+    save_job(job)
+    return {"words": [w.model_dump() for w in moment.caption_words]}
+
+
+@app.post("/api/jobs/{job_id}/moments/{moment_id}/rerender")
+def rerender_moment(job_id: str, moment_id: str) -> dict:
+    job = _job_or_404(job_id)
+    _moment_or_404(job, moment_id)
+    if job.status not in {"ready", "done", "error"}:
+        raise HTTPException(409, "Дождись конца текущего этапа, потом перемонтируй")
+    enqueue_render(job.id, [moment_id])
+    job.status = "rendering"
+    job.stage = "Перемонтаж субтитров в очереди"
     save_job(job)
     return job.model_dump()
 
@@ -184,4 +243,6 @@ def job_file(job_id: str, rest: str):
         media = "application/json"
     elif path.suffix == ".png":
         media = "image/png"
+    if path.suffix in {".mp4", ".webm", ".mov", ".wav"}:
+        return FileResponse(path, media_type=media)
     return FileResponse(path, media_type=media, filename=path.name)
