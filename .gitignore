@@ -1,0 +1,60 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# Secrets and local config
+.env
+.env.local
+.env.development
+.env.production
+
+# Pipeline output, VODs, clips, transcripts
+data/
+models/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.aac
+*.m4a
+*.mp3
+*.ass
+*.part
+*.ytdl
+*.raw.mp4
+
+# Whisper / Hugging Face caches if they land in the repo
+.cache/
+*.bin
+*.gguf
+*.safetensors
+*.onnx
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+.python-version
+
+# Personal notes not part of the generic product
+PLAN-WoW-Forever-LizaEasy.md
